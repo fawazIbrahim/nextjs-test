@@ -1,0 +1,75 @@
+.page {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+}
+
+.back {
+  display: inline-block;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+  color: color-mix(in srgb, var(--foreground) 65%, transparent);
+}
+
+.header {
+  margin-bottom: 2rem;
+}
+
+.headerTop {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.headerTop h1 {
+  font-size: 1.75rem;
+}
+
+.rating {
+  white-space: nowrap;
+}
+
+.cuisine {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--foreground) 55%, transparent);
+  margin-top: 0.35rem;
+}
+
+.description {
+  margin-top: 0.5rem;
+  line-height: 1.5;
+}
+
+.category {
+  margin-bottom: 2rem;
+}
+
+.category h2 {
+  font-size: 1.2rem;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--foreground) 15%, transparent);
+}
+
+.items {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.itemTop {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-weight: 600;
+}
+
+.itemDescription {
+  margin-top: 0.25rem;
+  font-size: 0.9rem;
+  color: color-mix(in srgb, var(--foreground) 65%, transparent);
+}
