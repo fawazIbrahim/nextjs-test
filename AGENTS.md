@@ -53,7 +53,7 @@ dev against the mock OTLP receiver.
 
 - `src/app/` — pages (App Router): `/` (restaurant list), `/restaurants/[id]` (menu + prices), `/health` (liveness check, see `design/DESIGN.md` §5.4).
 - `src/app/api/` — the mocked backend (Route Handlers over static fixtures in `src/lib/mock-backend/`).
-- `src/otel/` — OpenTelemetry setup: `server.ts` / `client.ts` (SDK registration, called from `src/instrumentation.ts` / `src/instrumentation-client.ts`), `metrics.ts` (custom metrics helper), `tracing.ts` (`withSpan()` custom span helper), `service-up.ts` (`recordHealthCheck()`, the `/health` freshness-windowed gauge — see below), `backends.ts` (`requireTempoUrl()`/`requireMimirUrl()`), `auth/` (the removable IBM App ID auth layer, `getGrafanaAuthHeaders()` — see `design/DESIGN.md` §7.11) — use these instead of reaching for `@opentelemetry/api` directly in app code.
+- `src/otel/` — OpenTelemetry setup: `server.ts` / `client.ts` (SDK registration, called from `src/instrumentation.ts` / `src/instrumentation-client.ts`), `metrics.ts` (custom metrics helper), `tracing.ts` (`withSpan()` custom span helper), `service-up.ts` (`recordHealthCheck()`, the `/health` freshness-windowed gauge — see below), `backends.ts` (`requireTempoUrl()`/`requireMimirUrl()`), `auth/` (the removable IBM App ID auth + tenant-scoping layer, `getGrafanaHeaders()` — see `design/DESIGN.md` §7.11) — use these instead of reaching for `@opentelemetry/api` directly in app code.
 - `src/app/otlp/[...path]/route.ts` — the browser-facing OTLP proxy: routes `/otlp/v1/traces`/`/otlp/v1/metrics` to `TEMPO_URL`/`MIMIR_URL` respectively, attaching the App ID auth header server-side. Not Next.js's `proxy.ts` file convention (Next 16 renamed the old `middleware.ts` to `proxy.ts`, an unrelated request-interception hook) — this is an ordinary Route Handler. See `design/DESIGN.md` §8.
 
 ## Conventions for AI agents working in this repo
@@ -65,12 +65,13 @@ dev against the mock OTLP receiver.
 - Don't have the browser talk to `TEMPO_URL`/`MIMIR_URL` directly, and
   don't have the server talk through `/otlp` — that split is intentional
   (§7.3 of the design doc), not an oversight.
-- Don't wire App ID-specific logic into `src/otel/server.ts` or the `/otlp`
-  route directly — it goes through `getGrafanaAuthHeaders()` from
-  `src/otel/auth/`, the one function everything else depends on. That
-  isolation is deliberate (§7.11): it's what makes the whole auth layer
-  removable by deleting one directory instead of hunting through the OTEL
-  wiring.
+- Don't wire App ID or `X-Scope-OrgID`/tenant-scoping logic into
+  `src/otel/server.ts` or the `/otlp` route directly — it goes through
+  `getGrafanaHeaders()` from `src/otel/auth/`, the one function everything
+  else depends on. That isolation is deliberate (§7.11): each concern
+  (App ID auth, tenant header) is independently deactivatable via its own
+  env var, and the whole thing is removable by deleting one directory
+  instead of hunting through the OTEL wiring.
 - The mock backend's spans (`src/lib/mock-backend/*`, `src/app/api/restaurants/**`)
   deliberately report under a different `service.name` (`<OTEL_SERVICE_NAME>-mock-api`)
   than the rest of the app, via `getMockApiTracer()` from `src/otel/server.ts`

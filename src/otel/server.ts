@@ -29,7 +29,7 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { buildResource } from "./resource";
 import { requireMimirUrl, requireTempoUrl } from "./backends";
-import { getGrafanaAuthHeaders } from "./auth";
+import { getGrafanaHeaders } from "./auth";
 
 // Server-side OTEL wiring, called once from src/instrumentation.ts.
 //
@@ -64,7 +64,7 @@ export function registerServerOtel(): void {
 
   const traceExporter = new OTLPTraceExporter({
     url: `${tempoUrl}/v1/traces`,
-    headers: getGrafanaAuthHeaders,
+    headers: getGrafanaHeaders,
   });
   const tracerProvider = new NodeTracerProvider({
     resource,
@@ -75,7 +75,7 @@ export function registerServerOtel(): void {
 
   const metricExporter = new OTLPMetricExporter({
     url: `${mimirUrl}/v1/metrics`,
-    headers: getGrafanaAuthHeaders,
+    headers: getGrafanaHeaders,
   });
   const meterProvider = new MeterProvider({
     resource,
@@ -143,7 +143,7 @@ function getOrCreateMockApiTracerProvider(): NodeTracerProvider {
     const mockApiResource = buildResource({ "service.runtime": "nodejs" }, "mock-api");
     const mockApiTraceExporter = new OTLPTraceExporter({
       url: `${tempoUrl}/v1/traces`,
-      headers: getGrafanaAuthHeaders,
+      headers: getGrafanaHeaders,
     });
     globalThis.__mockApiTracerProvider = new NodeTracerProvider({
       resource: mockApiResource,
@@ -175,7 +175,7 @@ function getOrCreateServiceUpMeterProvider(): MeterProvider {
     const serviceUpMetricExporter = new OTLPMetricExporter({
       url: `${mimirUrl}/v1/metrics`,
       temporalityPreference: AggregationTemporality.DELTA,
-      headers: getGrafanaAuthHeaders,
+      headers: getGrafanaHeaders,
     });
     globalThis.__serviceUpMeterProvider = new MeterProvider({
       resource: buildResource({ "service.runtime": "nodejs" }),

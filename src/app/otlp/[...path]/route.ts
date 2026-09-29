@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getGrafanaAuthHeaders } from "@/otel/auth";
+import { getGrafanaHeaders } from "@/otel/auth";
 import { requireMimirUrl, requireTempoUrl } from "@/otel/backends";
 
 // Browser-facing OTLP proxy. Replaces the old declarative `rewrites()`
@@ -33,7 +33,7 @@ export async function POST(request: Request, ctx: RouteContext<"/otlp/[...path]"
     return NextResponse.json({ error: `Unsupported OTLP path: /${signal}` }, { status: 404 });
   }
 
-  const authHeaders = await getGrafanaAuthHeaders();
+  const authHeaders = await getGrafanaHeaders();
   const body = await request.arrayBuffer();
 
   const upstreamResponse = await fetch(`${resolveUpstream()}/${signal}`, {

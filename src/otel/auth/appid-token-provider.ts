@@ -1,6 +1,6 @@
 // Fetches and caches an IBM Cloud App ID access token via the OAuth2
 // client-credentials grant. Nothing outside src/otel/auth/ should import
-// this file directly -- go through ./index.ts's getGrafanaAuthHeaders()
+// this file directly -- go through ./index.ts's getGrafanaHeaders()
 // instead, which is the one thing the rest of the app depends on. See
 // design/DESIGN.md §7.11.
 //

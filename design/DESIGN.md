@@ -63,6 +63,7 @@ already scaffolded (ESLint) — flag in §9 if you want any of these added.
 | `APPID_TOKEN_URL` | `https://us-south.appid.cloud.ibm.com/oauth/v4/<tenantId>/token` | Only if `TELEMETRY_AUTH_PROVIDER=appid` | App ID tenant's OAuth2 client-credentials token endpoint. |
 | `APPID_CLIENT_ID` | — | Only if `TELEMETRY_AUTH_PROVIDER=appid` | App ID client ID for the client-credentials grant. |
 | `APPID_CLIENT_SECRET` | — | Only if `TELEMETRY_AUTH_PROVIDER=appid` | App ID client secret. **Server-only** — never added to `next.config.ts`'s `env` block, unlike `OTLP_ENDPOINT`/resource attrs (§7.5). |
+| `GRAFANA_ORG_ID` | `my-tenant` | No | Sent as `X-Scope-OrgID` on every Tempo/Mimir request when set — their multi-tenancy header (§7.11). Omitted entirely if unset. |
 | `OTEL_SERVICE_NAME` | `restaurant-menu-viewer` | No (defaulted) | `service.name` resource attribute — see §7.5. |
 | `OTEL_SERVICE_VERSION` | `0.1.0` | No (defaulted from `npm_package_version`) | `service.version` resource attribute — see §7.5. |
 | `OTEL_DEPLOYMENT_ENVIRONMENT` | `development` / `staging` / `production` | No (defaulted) | `deployment.environment.name` resource attribute — see §7.5. |
@@ -636,14 +637,15 @@ No `Sampler`-level fix was needed here (contrast with §7.9's favicon.ico
 case): these are plain outgoing `HttpInstrumentation` spans with no
 competing Next-owned tracer involved, so the one hook is sufficient.
 
-### 7.11 Grafana authentication (IBM Cloud App ID)
+### 7.11 Grafana request headers (IBM Cloud App ID auth + tenant scoping)
 
-Tempo and Mimir require a bearer token on every OTLP request. This app
-gets one from IBM Cloud App ID via the OAuth2 client-credentials grant
-(client ID + secret against an App ID tenant), and the whole thing is
-built as a **removable layer**, not woven into the core OTEL wiring.
+Every request to Tempo/Mimir needs two kinds of headers this app has to
+attach itself: a bearer token (IBM Cloud App ID, OAuth2 client-credentials
+grant) and, for a multi-tenant Mimir/Tempo setup, an `X-Scope-OrgID`
+tenant header. Both are built as **removable layers**, not woven into the
+core OTEL wiring.
 
-**Isolation.** All App ID-specific code lives in `src/otel/auth/`:
+**Isolation.** All of this lives in `src/otel/auth/`:
 - `appid-token-provider.ts` — does the client-credentials POST, caches
   `{ accessToken, expiresAt }` on `globalThis` (same cross-module-instance
   reasoning as `__otelServerRegistered` etc. — Turbopack can hand a Route
@@ -651,22 +653,27 @@ built as a **removable layer**, not woven into the core OTEL wiring.
   refetches shortly before real expiry, and dedupes concurrent callers into
   one in-flight request.
 - `index.ts` — the **one function** everything else imports:
-  `getGrafanaAuthHeaders(): Promise<Record<string, string>>`. It checks
-  `TELEMETRY_AUTH_PROVIDER`; anything other than `"appid"` resolves to `{}`.
+  `getGrafanaHeaders(): Promise<Record<string, string>>`. It merges two
+  independently-gated pieces:
+  - `Authorization: Bearer <token>` — only when `TELEMETRY_AUTH_PROVIDER`
+    is `"appid"` (calls the token provider above); otherwise omitted.
+  - `X-Scope-OrgID: <value>` — only when `GRAFANA_ORG_ID` is set (a plain
+    env var read, no caching needed); otherwise omitted.
 
 Exactly five call sites depend on that function: the four `OTLPTraceExporter`/
 `OTLPMetricExporter` instances in `src/otel/server.ts` (§7.3), and
 `src/app/otlp/[...path]/route.ts` (§8). Nothing else in the codebase knows
-App ID exists.
+App ID or tenant scoping exist.
 
-- **Deactivate** (keep the code, stop using it): unset
-  `TELEMETRY_AUTH_PROVIDER`. Every export/proxy call goes out
-  unauthenticated. No file changes.
+- **Deactivate one piece** (keep the code, stop using it): unset the env
+  var that gates it — `TELEMETRY_AUTH_PROVIDER` for the bearer token,
+  `GRAFANA_ORG_ID` for the tenant header. Each stops being sent
+  independently of the other. No file changes either way.
 - **Remove entirely**: delete `src/otel/auth/`, delete the
-  `headers: getGrafanaAuthHeaders` line and its import at each of the five
-  call sites, delete the four `APPID_*`/`TELEMETRY_AUTH_PROVIDER` env vars.
-  Nothing else — sampler, resource attributes, span naming, mock-backend
-  code — has any awareness this layer exists.
+  `headers: getGrafanaHeaders` line and its import at each of the five
+  call sites, delete the `APPID_*`/`TELEMETRY_AUTH_PROVIDER`/
+  `GRAFANA_ORG_ID` env vars. Nothing else — sampler, resource attributes,
+  span naming, mock-backend code — has any awareness this layer exists.
 
 **Why a plain function works, not just a static header.** Verified against
 the installed SDK source
@@ -676,21 +683,25 @@ and `transport/http-exporter-transport.js`): the exporters' public
 `HeadersFactory = () => Promise<Record<string, string>>`, and
 `HttpExporterTransport.send()` calls `await this._parameters.headers()`
 **fresh on every export batch**, not once at construction. That's what
-makes token refresh transparent to the exporters — `getGrafanaAuthHeaders`
-is just passed as `headers:` directly, and the SDK re-invokes it (and
-therefore re-checks the cached token's expiry) on its own schedule. No
-polling, no manual refresh timer, no exporter re-construction.
+makes token refresh transparent to the exporters — `getGrafanaHeaders` is
+just passed as `headers:` directly, and the SDK re-invokes it (and
+therefore re-checks the cached token's expiry, and re-reads
+`GRAFANA_ORG_ID`) on its own schedule. No polling, no manual refresh timer,
+no exporter re-construction.
 
 **Why the browser can't do any of this itself.** The App ID client secret
 must never reach the client bundle — unlike `OTLP_ENDPOINT`/resource attrs
 (§7.5), it's never added to `next.config.ts`'s `env` block. The browser
 still only ever talks to the same-origin `/otlp` path; the proxy route
-attaches the header server-side (§8).
+attaches both headers server-side (§8). `GRAFANA_ORG_ID` isn't secret, but
+it stays server-side too, for the same reason `TEMPO_URL`/`MIMIR_URL` do —
+one place that knows how to talk to the backends, not two.
 
-**Scope of the credential.** One token, obtained once, is used for both
-Tempo and Mimir. If App ID ever needs to scope credentials per-backend
-(e.g. different client IDs for traces vs. metrics), `getGrafanaAuthHeaders`
-would need a `signal` parameter — not needed today, noted here so it's not
+**Scope of the credential.** One token and one tenant header, obtained
+once, are used for both Tempo and Mimir. If App ID ever needs to scope
+credentials per-backend, or a different org ID per signal (e.g. different
+client IDs/tenants for traces vs. metrics), `getGrafanaHeaders` would need
+a `signal` parameter — not needed today, noted here so it's not
 rediscovered from scratch later.
 
 ## 8. The `/otlp` proxy
@@ -731,7 +742,7 @@ export async function POST(request: Request, ctx: RouteContext<"/otlp/[...path]"
     return NextResponse.json({ error: `Unsupported OTLP path: /${signal}` }, { status: 404 });
   }
 
-  const authHeaders = await getGrafanaAuthHeaders(); // src/otel/auth, §7.11
+  const authHeaders = await getGrafanaHeaders(); // src/otel/auth, §7.11
   const body = await request.arrayBuffer();
 
   const upstreamResponse = await fetch(`${resolveUpstream()}/${signal}`, {
@@ -838,8 +849,9 @@ Initial implementation (2026-09-23):
 Alloy removal (2026-09-29):
 
 - [x] `src/otel/backends.ts` — `requireTempoUrl()`/`requireMimirUrl()`, replacing `requireAlloyUrl()`.
-- [x] `src/otel/auth/appid-token-provider.ts` + `src/otel/auth/index.ts` (`getGrafanaAuthHeaders()`) — see §7.11.
-- [x] `src/otel/server.ts` — all 4 exporters repointed to `TEMPO_URL`/`MIMIR_URL` with `headers: getGrafanaAuthHeaders`; `isAlloyRequest`/`isAlloyRequestOrigin` generalized to a two-host `Set` (§7.10).
+- [x] `src/otel/auth/appid-token-provider.ts` + `src/otel/auth/index.ts` (`getGrafanaHeaders()`) — see §7.11.
+- [x] `src/otel/server.ts` — all 4 exporters repointed to `TEMPO_URL`/`MIMIR_URL` with `headers: getGrafanaHeaders`; `isAlloyRequest`/`isAlloyRequestOrigin` generalized to a two-host `Set` (§7.10).
+- [x] `GRAFANA_ORG_ID` support added (2026-09-29, same-day follow-up) — `getGrafanaHeaders()` merges in `X-Scope-OrgID` when set, independently of the App ID bearer token. Same 5 call sites, no new ones.
 - [x] `src/app/otlp/[...path]/route.ts` — replaces `proxy.conf.js`; routes by OTLP signal to Tempo/Mimir, attaches the auth header (§8).
 - [x] `proxy.conf.js` deleted; `next.config.ts`'s `rewrites()` removed (the `env` block, unrelated, stays).
 - [x] `.env.example`, `scripts/mock-otlp-receiver.mjs`, `README.md` updated for `TEMPO_URL`/`MIMIR_URL`/`TELEMETRY_AUTH_PROVIDER`/`APPID_*`.
