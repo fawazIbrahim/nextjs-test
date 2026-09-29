@@ -1,7 +1,11 @@
 # Design: Restaurant Menu Viewer
 
-Status: **Implemented (2026-09-23).** All §9 decisions were confirmed
-(all recommended defaults accepted) and verified per §10.
+Status: **Implemented (2026-09-23), revised (2026-09-29).** All §9
+decisions were confirmed (all recommended defaults accepted) and verified
+per §10. The 2026-09-29 revision **removed Grafana Alloy** from the
+architecture: this app now exports traces directly to Tempo and metrics
+directly to Mimir over OTLP/HTTP, with IBM Cloud App ID providing the
+bearer token both need. See §7.3, §7.11, and §8.
 
 This document is the single source of truth for what will be built. Read
 it before touching telemetry, proxy, or mock-backend code. If the
@@ -14,17 +18,23 @@ A simple Next.js web app that lists restaurants and, per restaurant, shows
 its menu and prices. Restaurant/menu data comes from "another backend",
 which is simulated with a mock (no real backend exists). The app emits
 OpenTelemetry traces and metrics — including app-defined custom metrics —
-to Grafana Alloy over OTLP/HTTP, routed through a same-origin proxy path so
-the browser never needs to know Alloy's real network address.
+directly to Grafana's Tempo (traces) and Mimir (metrics) backends over
+OTLP/HTTP, authenticated with a bearer token obtained from IBM Cloud App ID
+(§7.11). Browser-originated telemetry is routed through a same-origin proxy
+path so the browser never needs to know Tempo/Mimir's real network
+addresses — or the App ID credential (§7.3/§8).
 
 ## 2. Non-goals
 
 - Authentication, ordering, cart, payments.
 - A persistent database. Mock data is static, in-memory, served over HTTP
   from Route Handlers inside this same Next.js app.
-- Deploying/running an actual Grafana Alloy instance — that's assumed to
-  exist already (or be run separately, e.g. via Docker) and reachable at
-  whatever `ALLOY_URL` points to.
+- Deploying/running the Tempo, Mimir, or IBM Cloud App ID instances this
+  app talks to — all three are assumed to exist already and be reachable
+  at whatever `TEMPO_URL`/`MIMIR_URL`/`APPID_TOKEN_URL` point to. In
+  particular, **Mimir must have native OTLP ingestion enabled** — this app
+  sends OTLP/HTTP directly, not Prometheus remote-write, and that's a
+  Mimir-side configuration prerequisite outside this repo. See §7.11.
 - Multi-locale/i18n, accessibility audit, design system — kept intentionally
   minimal (plain CSS, no UI kit) unless the review asks otherwise.
 
@@ -46,8 +56,13 @@ already scaffolded (ESLint) — flag in §9 if you want any of these added.
 
 | Variable | Example | Required | Purpose |
 |---|---|---|---|
-| `ALLOY_URL` | `http://localhost:12345` | Yes | Base URL of the Grafana Alloy OTLP/HTTP receiver. Used by (a) the dev/prod proxy rewrite target, and (b) the server-side OTLP exporters directly (see §7.3). |
-| `OTLP_ENDPOINT` | `/otlp` | Yes (defaults to `/otlp`) | The same-origin path prefix the **browser** sends telemetry to. Proxied by Next's `rewrites()` to `ALLOY_URL` with the prefix stripped. |
+| `TEMPO_URL` | `http://localhost:4318` | Yes | Base URL of Tempo's OTLP/HTTP receiver. Used directly by the server-side trace exporters, and as one of two proxy targets for browser telemetry (see §7.3/§7.11/§8). |
+| `MIMIR_URL` | `http://localhost:4318` | Yes | Base URL of Mimir's **native OTLP** ingestion endpoint (not its Prometheus remote-write endpoint — see §7.11's note). Used directly by the server-side metric exporters, and as the other proxy target for browser telemetry. |
+| `OTLP_ENDPOINT` | `/otlp` | Yes (defaults to `/otlp`) | The same-origin path prefix the **browser** sends telemetry to. Forwarded by `src/app/otlp/[...path]/route.ts` to `TEMPO_URL` or `MIMIR_URL` depending on the OTLP signal path, with the App ID auth header attached server-side (§7.11/§8). |
+| `TELEMETRY_AUTH_PROVIDER` | `appid` | No (defaults to unset/none) | Set to `appid` to authenticate every export with an IBM Cloud App ID access token. The single on/off switch for the `src/otel/auth/` layer — see §7.11. |
+| `APPID_TOKEN_URL` | `https://us-south.appid.cloud.ibm.com/oauth/v4/<tenantId>/token` | Only if `TELEMETRY_AUTH_PROVIDER=appid` | App ID tenant's OAuth2 client-credentials token endpoint. |
+| `APPID_CLIENT_ID` | — | Only if `TELEMETRY_AUTH_PROVIDER=appid` | App ID client ID for the client-credentials grant. |
+| `APPID_CLIENT_SECRET` | — | Only if `TELEMETRY_AUTH_PROVIDER=appid` | App ID client secret. **Server-only** — never added to `next.config.ts`'s `env` block, unlike `OTLP_ENDPOINT`/resource attrs (§7.5). |
 | `OTEL_SERVICE_NAME` | `restaurant-menu-viewer` | No (defaulted) | `service.name` resource attribute — see §7.5. |
 | `OTEL_SERVICE_VERSION` | `0.1.0` | No (defaulted from `npm_package_version`) | `service.version` resource attribute — see §7.5. |
 | `OTEL_DEPLOYMENT_ENVIRONMENT` | `development` / `staging` / `production` | No (defaulted) | `deployment.environment.name` resource attribute — see §7.5. |
@@ -58,8 +73,12 @@ committed `.env.example` documenting them (requires a `!.env.example`
 exception added to `.gitignore`, since `create-next-app` ignores all
 `.env*` files by default).
 
-`next.config.ts` will throw a clear startup error if `ALLOY_URL` is unset,
-rather than silently proxying to `undefined`.
+`src/otel/backends.ts`'s `requireTempoUrl()`/`requireMimirUrl()` throw a
+clear error if `TEMPO_URL`/`MIMIR_URL` is unset, rather than silently
+exporting to `undefined`. Unlike the old `ALLOY_URL` check, this no longer
+happens in `next.config.ts` at process startup — there's no `rewrites()`
+config left to gate that check on (§8) — it happens lazily, the first time
+`registerServerOtel()` or the `/otlp` proxy route actually needs a URL.
 
 ## 5. Mock backend
 
@@ -126,15 +145,13 @@ responsiveness.
 Every call also marks the service as freshly checked, which
 `src/otel/service-up.ts` turns into a `service_up` gauge metric through
 the same server-side OTEL pipeline as everything else (§7.3: exported
-directly to `ALLOY_URL`, protobuf). This is what turns "is the service
-up" from a one-off HTTP response into a queryable time series once it
-lands in Mimir — the metrics storage backend behind Alloy in this stack.
-**This app never talks to Mimir directly**; it emits OTLP metrics to
-Alloy exactly as it does for every other metric in §7, and whatever
-Alloy is configured to do with them (typically `remote_write` to Mimir)
-is outside this app's boundary and this design doc's scope. A gauge
-(not a counter) is used because "is it up right now" is a current-state
-signal, following the same shape as Prometheus's own `up` metric.
+directly to `MIMIR_URL`, protobuf). This is what turns "is the service
+up" from a one-off HTTP response into a queryable time series in Mimir.
+**This app talks to Mimir directly**, over its native OTLP ingestion
+endpoint (§7.11) — there's no collector in between as of the 2026-09-29
+revision. A gauge (not a counter) is used because "is it up right now" is
+a current-state signal, following the same shape as Prometheus's own `up`
+metric.
 
 **This is an `ObservableGauge` with a freshness window, not the plain
 synchronous `recordGauge()` from `src/otel/metrics.ts`, and it only ever
@@ -206,19 +223,29 @@ in dev with Fast Refresh).
 ### 7.3 Where telemetry is sent — the key design decision
 
 - **Browser → `${OTLP_ENDPOINT}/v1/traces` and `${OTLP_ENDPOINT}/v1/metrics`**
-  (i.e. `/otlp/v1/traces`), same-origin. The Next server proxies this to
-  `ALLOY_URL` (§8). The browser never sees `ALLOY_URL`.
-- **Server → `${ALLOY_URL}/v1/traces` and `${ALLOY_URL}/v1/metrics` directly**,
-  bypassing the `/otlp` proxy entirely.
+  (i.e. `/otlp/v1/traces`, `/otlp/v1/metrics`), same-origin.
+  `src/app/otlp/[...path]/route.ts` forwards the former to `TEMPO_URL` and
+  the latter to `MIMIR_URL`, attaching the App ID auth header itself
+  (§7.11/§8). The browser never sees `TEMPO_URL`, `MIMIR_URL`, or the App ID
+  credential.
+- **Server → `${TEMPO_URL}/v1/traces` and `${MIMIR_URL}/v1/metrics` directly**,
+  bypassing the `/otlp` proxy entirely (`src/otel/server.ts`).
 
 Rationale: the proxy exists to solve a **browser** problem (the browser may
-not be able to resolve/reach Alloy directly — different network namespace,
-CORS, or a desire not to expose the collector's address to clients). The
-Node server process has none of those constraints; it can reach `ALLOY_URL`
-directly. Routing server telemetry through its own HTTP proxy would mean
-the app calling back into itself over the network for no benefit, adding
-latency and a failure mode (if the server is overloaded, its own telemetry
-export competes with and depends on its own HTTP listener).
+not be able to resolve/reach Tempo/Mimir directly — different network
+namespace, CORS, or a desire not to expose the backends' addresses to
+clients — and it can never hold the App ID client secret at all). The Node
+server process has none of those constraints; it can reach `TEMPO_URL`/
+`MIMIR_URL` directly and fetch its own App ID token server-side. Routing
+server telemetry through its own HTTP proxy would mean the app calling back
+into itself over the network for no benefit, adding latency and a failure
+mode (if the server is overloaded, its own telemetry export competes with
+and depends on its own HTTP listener).
+
+Note this rationale predates the App ID requirement (§7.11) but still
+holds with it in place: both paths need the same auth header now, but only
+the browser path needs a same-origin hop to get one attached without
+exposing the credential.
 
 **This is the part most worth double-checking against your actual
 intent** — if you specifically want *all* telemetry, including
@@ -429,7 +456,7 @@ resource attribute, not a span attribute — so this can't be done by
 tagging spans with an extra attribute; it requires a second `Resource`,
 which requires a second `TracerProvider`. `src/otel/server.ts` builds one
 (`buildResource({ "service.runtime": "nodejs" }, "mock-api")`, its own
-`OTLPTraceExporter` pointed at the same `ALLOY_URL`) but does **not**
+`OTLPTraceExporter` pointed at the same `TEMPO_URL`) but does **not**
 call `.register()` on it — registering would replace the app's single
 global tracer provider. Instead it's exposed as `getMockApiTracer()`,
 and only `src/lib/mock-backend/latency.ts` and the two
@@ -578,8 +605,8 @@ needs revisiting.
 ### 7.10 Excluding this app's own OTLP export calls from tracing
 
 `OTLPTraceExporter`/`OTLPMetricExporter` (from the `-proto` packages,
-§7.1) POST to `ALLOY_URL` using Node's `http`/`https` core modules
-directly (the `node-http` transport — confirmed from the installed
+§7.1) POST to `TEMPO_URL`/`MIMIR_URL` using Node's `http`/`https` core
+modules directly (the `node-http` transport — confirmed from the installed
 package's source, not fetch/undici). `HttpInstrumentation` patches those
 same core modules for *outgoing* requests app-wide, so without exclusion
 every export POST — both trace and metric, from both the main tracer's
@@ -594,15 +621,77 @@ Fixed the same way as the outgoing-side static-asset exclusion would be
 (§7.9 covers the *incoming* side): `HttpInstrumentation`'s
 `ignoreOutgoingRequestHook(request): boolean`, checking the request's
 resolved host (`request.host`, or `hostname:port` when `host` isn't set)
-against `new URL(ALLOY_URL).host`, computed once in `registerServerOtel()`.
-`UndiciInstrumentation` gets the matching `ignoreRequestHook` too (via
-`request.origin`), even though the exporters don't currently use
-fetch/undici — cheap, harmless if it never matches, and keeps the two
-instrumentations consistent if the transport ever changes.
+against a `Set` of both backend hosts (`new URL(TEMPO_URL).host`,
+`new URL(MIMIR_URL).host`, computed once in `registerServerOtel()` —
+two hosts now instead of one, since there's no single collector in front
+of them to unify the destination). `UndiciInstrumentation` gets the
+matching `ignoreRequestHook` too (via `request.origin`), even though the
+exporters don't currently use fetch/undici — cheap, harmless if it never
+matches, and keeps the two instrumentations consistent if the transport
+ever changes. This same host-set check also covers the `/otlp` proxy
+route's own outgoing `fetch()` calls to Tempo/Mimir (§8) — one exclusion
+mechanism, no separate hook needed for the proxy.
 
 No `Sampler`-level fix was needed here (contrast with §7.9's favicon.ico
 case): these are plain outgoing `HttpInstrumentation` spans with no
 competing Next-owned tracer involved, so the one hook is sufficient.
+
+### 7.11 Grafana authentication (IBM Cloud App ID)
+
+Tempo and Mimir require a bearer token on every OTLP request. This app
+gets one from IBM Cloud App ID via the OAuth2 client-credentials grant
+(client ID + secret against an App ID tenant), and the whole thing is
+built as a **removable layer**, not woven into the core OTEL wiring.
+
+**Isolation.** All App ID-specific code lives in `src/otel/auth/`:
+- `appid-token-provider.ts` — does the client-credentials POST, caches
+  `{ accessToken, expiresAt }` on `globalThis` (same cross-module-instance
+  reasoning as `__otelServerRegistered` etc. — Turbopack can hand a Route
+  Handler a separate module instance from `src/instrumentation.ts` in dev),
+  refetches shortly before real expiry, and dedupes concurrent callers into
+  one in-flight request.
+- `index.ts` — the **one function** everything else imports:
+  `getGrafanaAuthHeaders(): Promise<Record<string, string>>`. It checks
+  `TELEMETRY_AUTH_PROVIDER`; anything other than `"appid"` resolves to `{}`.
+
+Exactly five call sites depend on that function: the four `OTLPTraceExporter`/
+`OTLPMetricExporter` instances in `src/otel/server.ts` (§7.3), and
+`src/app/otlp/[...path]/route.ts` (§8). Nothing else in the codebase knows
+App ID exists.
+
+- **Deactivate** (keep the code, stop using it): unset
+  `TELEMETRY_AUTH_PROVIDER`. Every export/proxy call goes out
+  unauthenticated. No file changes.
+- **Remove entirely**: delete `src/otel/auth/`, delete the
+  `headers: getGrafanaAuthHeaders` line and its import at each of the five
+  call sites, delete the four `APPID_*`/`TELEMETRY_AUTH_PROVIDER` env vars.
+  Nothing else — sampler, resource attributes, span naming, mock-backend
+  code — has any awareness this layer exists.
+
+**Why a plain function works, not just a static header.** Verified against
+the installed SDK source
+(`@opentelemetry/otlp-exporter-base/build/src/configuration/otlp-http-configuration.d.ts`
+and `transport/http-exporter-transport.js`): the exporters' public
+`headers` option accepts `Record<string, string> | HeadersFactory`, where
+`HeadersFactory = () => Promise<Record<string, string>>`, and
+`HttpExporterTransport.send()` calls `await this._parameters.headers()`
+**fresh on every export batch**, not once at construction. That's what
+makes token refresh transparent to the exporters — `getGrafanaAuthHeaders`
+is just passed as `headers:` directly, and the SDK re-invokes it (and
+therefore re-checks the cached token's expiry) on its own schedule. No
+polling, no manual refresh timer, no exporter re-construction.
+
+**Why the browser can't do any of this itself.** The App ID client secret
+must never reach the client bundle — unlike `OTLP_ENDPOINT`/resource attrs
+(§7.5), it's never added to `next.config.ts`'s `env` block. The browser
+still only ever talks to the same-origin `/otlp` path; the proxy route
+attaches the header server-side (§8).
+
+**Scope of the credential.** One token, obtained once, is used for both
+Tempo and Mimir. If App ID ever needs to scope credentials per-backend
+(e.g. different client IDs for traces vs. metrics), `getGrafanaAuthHeaders`
+would need a `signal` parameter — not needed today, noted here so it's not
+rediscovered from scratch later.
 
 ## 8. The `/otlp` proxy
 
@@ -610,91 +699,130 @@ competing Next-owned tracer involved, so the one hook is sufficient.
 
 Next.js 16 renamed its `middleware.ts` file convention to **`proxy.ts`**
 (a request-interception hook for auth/redirects, unrelated to reverse
-proxying to an external host). This is a coincidental naming collision
-with what you asked for. **`proxy.conf.js` in this design is not that
-file** — it's a plain config module (styled after the Angular CLI's
-`proxy.conf.js`, matching the `"^/otlp": ""` rewrite convention you
-described) that feeds Next's `rewrites()` config, which is the mechanism
-Next.js actually uses for path-rewriting to an external destination.
+proxying to an external host). This section's `/otlp` proxy is **not**
+that file — it's an ordinary Route Handler
+(`src/app/otlp/[...path]/route.ts`), the same mechanism `/api/restaurants`
+already uses (§5.1), just used to forward instead of to answer from mock
+data.
 
-### 8.2 Files
+### 8.2 Why a Route Handler, not `rewrites()`
 
-**`proxy.conf.js`** (project root, CommonJS):
-
-```js
-// Mirrors Angular-CLI-style proxy config: path pattern -> rewrite -> target.
-// Consumed by next.config.ts's rewrites(); not a Next.js "proxy" file.
-module.exports = function getOtlpProxyRewrites() {
-  const alloyUrl = process.env.ALLOY_URL;
-  const otlpEndpoint = process.env.OTLP_ENDPOINT || "/otlp";
-
-  if (!alloyUrl) {
-    throw new Error(
-      "ALLOY_URL environment variable is required to configure the OTLP proxy."
-    );
-  }
-
-  return [
-    {
-      source: `${otlpEndpoint}/:path*`,
-      destination: `${alloyUrl}/:path*`,
-    },
-  ];
-};
-```
-
-**`next.config.ts`**:
+Before §7.11's App ID requirement, this proxy was a declarative
+`rewrites()` config (`proxy.conf.js`, styled after Angular CLI's
+`proxy.conf.js`) — Next just changed the destination URL and passed the
+request through unmodified, which was enough when Alloy needed no auth. A
+plain rewrite has no way to **add a header** to the forwarded request, and
+Tempo/Mimir both require the App ID bearer token on every call (§7.11). So
+the proxy became real server code that can actually attach one:
 
 ```ts
-import type { NextConfig } from "next";
-import getOtlpProxyRewrites from "../proxy.conf.js"; // illustrative path
-
-const nextConfig: NextConfig = {
-  async rewrites() {
-    return getOtlpProxyRewrites();
-  },
+// src/app/otlp/[...path]/route.ts
+const SIGNAL_UPSTREAM: Record<string, () => string> = {
+  "v1/traces": requireTempoUrl,
+  "v1/metrics": requireMimirUrl,
 };
 
-export default nextConfig;
+export async function POST(request: Request, ctx: RouteContext<"/otlp/[...path]">) {
+  const { path } = await ctx.params;
+  const signal = path.join("/"); // "v1/traces" or "v1/metrics"
+
+  const resolveUpstream = SIGNAL_UPSTREAM[signal];
+  if (!resolveUpstream) {
+    return NextResponse.json({ error: `Unsupported OTLP path: /${signal}` }, { status: 404 });
+  }
+
+  const authHeaders = await getGrafanaAuthHeaders(); // src/otel/auth, §7.11
+  const body = await request.arrayBuffer();
+
+  const upstreamResponse = await fetch(`${resolveUpstream()}/${signal}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": request.headers.get("content-type") ?? "application/x-protobuf",
+      ...authHeaders,
+    },
+    body,
+  });
+
+  return new NextResponse(await upstreamResponse.arrayBuffer(), {
+    status: upstreamResponse.status,
+    headers: { "Content-Type": upstreamResponse.headers.get("content-type") ?? "application/json" },
+  });
+}
 ```
 
-Effectively: a request to `/otlp/v1/traces` is rewritten to
-`${ALLOY_URL}/v1/traces` — the `^/otlp` prefix is stripped (replaced by
-nothing) exactly as `"^/otlp": ""` in an Angular-style proxy config would
-do, and the remainder is forwarded to the `ALLOY_URL` target.
+Two things this does that a rewrite couldn't:
+- **Attaches the App ID auth header server-side**, so the browser never
+  needs the credential that produces it.
+- **Routes by OTLP signal to two different upstream hosts** — Tempo for
+  `/v1/traces`, Mimir for `/v1/metrics` — since there's no single collector
+  in front of them anymore doing that split itself (contrast with the old
+  one-`ALLOY_URL`-fits-both-signals setup).
+
+This route's own path is fixed by its file-system location
+(`src/app/otlp/[...path]/`), not by the `OTLP_ENDPOINT` env var — if you
+change `OTLP_ENDPOINT` away from `/otlp`, move this folder to match.
 
 ### 8.3 Constraints this implies
 
 - Requires running Next's own server (`next dev` or `next start`) — will
   **not** work with `next export`/static hosting. Acceptable since Route
   Handlers already require a server.
-  - `rewrites()` to an external URL work in both dev and prod the same way.
-- OTLP requests from the browser are POST with a `Content-Type` of
-  `application/x-protobuf` or `application/json` depending on exporter
-  choice; Next rewrites don't alter method/body, so this is transparent.
+- The proxy's own outgoing `fetch()` calls to Tempo/Mimir are excluded from
+  tracing by the same host-set check as the server exporters' own export
+  calls (§7.10) — otherwise every proxied browser telemetry batch would
+  produce a span about proxying telemetry.
+- Only `POST` is implemented (OTLP/HTTP is POST-only); any other method
+  gets Next's default `405` for an unmapped Route Handler method.
 
-### 8.4 Local development without a real Alloy
+### 8.4 Local development without real Tempo/Mimir
 
 `scripts/mock-otlp-receiver.mjs` (run via `npm run mock:otlp`) is a
-zero-dependency stand-in: it accepts any OTLP/HTTP POST, logs the method,
-path, content-type, and byte size, and responds `200`. Point `ALLOY_URL`
-at it for local dev when a real Alloy isn't available. See README.md "Run
-it locally" for the exact steps.
+zero-dependency stand-in: it accepts any OTLP/HTTP POST regardless of path,
+logs the method, path, content-type, and byte size, and responds `200`.
+Point **both** `TEMPO_URL` and `MIMIR_URL` at it for local dev — it doesn't
+care which signal a request claims to be; that routing decision happens in
+`src/otel/server.ts`/the proxy route, not in the mock receiver itself. See
+README.md "Run it locally" for the exact steps.
 
-## 9. Decisions (confirmed 2026-09-23)
+## 9. Decisions
+
+Confirmed 2026-09-23 (initial implementation):
 
 1. **Server telemetry path** (§7.3): **confirmed** — server exporters talk
-   to `ALLOY_URL` directly; only the browser goes through `/otlp`.
+   to Tempo/Mimir directly; only the browser goes through `/otlp`.
 2. **Mock backend shape** (§5.3): **confirmed** — Next.js Route Handlers.
 3. **OTLP wire format**: **confirmed** — protobuf, for both traces and
-   metrics, matching Alloy's default OTLP receiver.
+   metrics.
 4. **Styling**: **confirmed** — plain CSS Modules, no new dependency.
 5. **Fixture size**: 5–8 restaurants / 3–6 menu items each, hand-written —
    proceeding with this as no objection was raised.
 6. **No automated tests** beyond `next lint` / `tsc --noEmit` — proceeding
    with this as no objection was raised. Can be revisited later.
 
+Confirmed 2026-09-29 (Alloy removal):
+
+7. **Remove Grafana Alloy; export directly to Tempo/Mimir** (§7.3/§7.11/§8):
+   **confirmed**. Mimir only exposes Prometheus remote-write
+   (`/mimir/api/v1/push`) at first inspection — incompatible with this
+   app's `OTLPMetricExporter`, since OpenTelemetry JS has no official
+   remote-write exporter. Resolved by enabling **Mimir's native OTLP
+   ingestion** instead of hand-rolling a remote-write exporter or keeping a
+   converter process in front of Mimir — an infra-side prerequisite (§2),
+   not an app change.
+8. **Grafana auth via IBM Cloud App ID, as a removable layer** (§7.11):
+   **confirmed** — client-credentials grant, isolated to `src/otel/auth/`,
+   gated by a single `TELEMETRY_AUTH_PROVIDER` env var, with exactly five
+   call sites depending on it app-wide.
+9. **Multiple API keys / multi-tenant ingestion**: considered as an
+   alternative to App ID (each caller given its own static bearer token,
+   validated via `otelcol.auth.bearer` on a per-app Alloy receiver) but not
+   pursued once the decision to remove Alloy entirely was made — moot
+   without a collector in front of Tempo/Mimir to hold that per-app
+   receiver config.
+
 ## 10. Implementation checklist
+
+Initial implementation (2026-09-23):
 
 - [x] `.env.example` + `.gitignore` exception (`.env.local` stays untracked, create your own from `.env.example`)
 - [x] `proxy.conf.js` + `next.config.ts` wiring, with a fail-fast check for `ALLOY_URL` (also enforced independently in `src/otel/server.ts`)
@@ -706,3 +834,14 @@ it locally" for the exact steps.
 - [x] Manual verification (2026-09-23): ran a stub OTLP/HTTP receiver as `ALLOY_URL`. Confirmed: `npm run lint` / `tsc --noEmit` / `npm run build` all clean; `GET /`, `GET /restaurants/[id]`, `GET /api/restaurants[/[id]]` all 200; `POST /otlp/v1/traces` correctly rewritten to the receiver with the `/otlp` prefix stripped; real server-emitted trace and metric batches arrived at the receiver as `application/x-protobuf`, sent **directly** to `ALLOY_URL` (not through `/otlp`), matching §7.3; `registerBrowserOtel` confirmed present in the compiled client bundle (browser execution itself wasn't exercised — no headless browser available — but the server-side pipeline it mirrors is verified end-to-end).
 - [x] Corrected during implementation: `@opentelemetry/exporter-trace-otlp-http` / `-metrics-otlp-http` default to **JSON** in the installed version (0.222.0), not protobuf as assumed while drafting §7.1. Switched to `@opentelemetry/exporter-trace-otlp-proto` / `-metrics-otlp-proto`, which do use protobuf, to honor the §9 decision. See the note under §7.1.
 - [x] `design/DESIGN.md` "Status" updated to reflect implementation.
+
+Alloy removal (2026-09-29):
+
+- [x] `src/otel/backends.ts` — `requireTempoUrl()`/`requireMimirUrl()`, replacing `requireAlloyUrl()`.
+- [x] `src/otel/auth/appid-token-provider.ts` + `src/otel/auth/index.ts` (`getGrafanaAuthHeaders()`) — see §7.11.
+- [x] `src/otel/server.ts` — all 4 exporters repointed to `TEMPO_URL`/`MIMIR_URL` with `headers: getGrafanaAuthHeaders`; `isAlloyRequest`/`isAlloyRequestOrigin` generalized to a two-host `Set` (§7.10).
+- [x] `src/app/otlp/[...path]/route.ts` — replaces `proxy.conf.js`; routes by OTLP signal to Tempo/Mimir, attaches the auth header (§8).
+- [x] `proxy.conf.js` deleted; `next.config.ts`'s `rewrites()` removed (the `env` block, unrelated, stays).
+- [x] `.env.example`, `scripts/mock-otlp-receiver.mjs`, `README.md` updated for `TEMPO_URL`/`MIMIR_URL`/`TELEMETRY_AUTH_PROVIDER`/`APPID_*`.
+- [x] `npm run lint` and `npx tsc --noEmit` clean (`npx next typegen` was needed once, to regenerate `RouteContext<"/otlp/[...path]">`'s type for the new route).
+- [ ] Not yet done: manual end-to-end verification against a real (or mock) Tempo/Mimir with `TELEMETRY_AUTH_PROVIDER=appid` set — the token-fetch path itself is untested against a live App ID tenant.

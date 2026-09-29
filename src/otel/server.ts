@@ -28,13 +28,15 @@ import {
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { buildResource } from "./resource";
+import { requireMimirUrl, requireTempoUrl } from "./backends";
+import { getGrafanaAuthHeaders } from "./auth";
 
 // Server-side OTEL wiring, called once from src/instrumentation.ts.
 //
-// Talks to ALLOY_URL DIRECTLY — it does NOT go through the /otlp proxy.
+// Talks to Tempo/Mimir DIRECTLY — it does NOT go through the /otlp proxy.
 // That proxy exists to solve a browser-only problem (the browser can't
-// reach ALLOY_URL directly / shouldn't know its address). The Node
-// process has no such constraint. See design/DESIGN.md §7.3 for the full
+// reach them directly / shouldn't know their address). The Node process
+// has no such constraint. See design/DESIGN.md §7.3 for the full
 // rationale and the confirmed decision.
 //
 // State lives on `globalThis`, not module-scope variables: Next/Turbopack
@@ -55,12 +57,14 @@ export function registerServerOtel(): void {
   }
   globalThis.__otelServerRegistered = true;
 
-  const alloyUrl = requireAlloyUrl();
-  const alloyHost = new URL(alloyUrl).host;
+  const tempoUrl = requireTempoUrl();
+  const mimirUrl = requireMimirUrl();
+  const telemetryBackendHosts = new Set([new URL(tempoUrl).host, new URL(mimirUrl).host]);
   const resource = buildResource({ "service.runtime": "nodejs" });
 
   const traceExporter = new OTLPTraceExporter({
-    url: `${alloyUrl}/v1/traces`,
+    url: `${tempoUrl}/v1/traces`,
+    headers: getGrafanaAuthHeaders,
   });
   const tracerProvider = new NodeTracerProvider({
     resource,
@@ -70,7 +74,8 @@ export function registerServerOtel(): void {
   tracerProvider.register();
 
   const metricExporter = new OTLPMetricExporter({
-    url: `${alloyUrl}/v1/metrics`,
+    url: `${mimirUrl}/v1/metrics`,
+    headers: getGrafanaAuthHeaders,
   });
   const meterProvider = new MeterProvider({
     resource,
@@ -87,13 +92,14 @@ export function registerServerOtel(): void {
         // in practice, static asset serving (_next/static, _next/image).
         // Don't trace those at all — see design/DESIGN.md §7.9.
         ignoreIncomingRequestHook: (request) => isStaticAssetPath(request.url),
-        // Don't trace this app's own OTLP exports to Alloy (the node-http
+        // Don't trace this app's own OTLP exports to Tempo/Mimir (the node-http
         // transport used by OTLPTraceExporter/OTLPMetricExporter is plain
         // http/https, so it's this instrumentation's OUTGOING side that
         // would otherwise wrap every export POST in its own span — noise
         // about the telemetry pipeline itself, not app behavior. See
         // design/DESIGN.md §7.10.
-        ignoreOutgoingRequestHook: (request) => isAlloyRequest(request, alloyHost),
+        ignoreOutgoingRequestHook: (request) =>
+          isTelemetryBackendRequest(request, telemetryBackendHosts),
         // Default incoming-request span name is just the method ("GET") —
         // Node's raw http module has no concept of a route. Rename it to
         // "GET /path" so spans are identifiable in Grafana Tempo.
@@ -108,7 +114,8 @@ export function registerServerOtel(): void {
         // the OTLP exporters don't currently use fetch/undici (they use
         // Node's http/https directly), so this shouldn't ever match, but
         // keeps the two instrumentations consistent if that changes.
-        ignoreRequestHook: (request) => isAlloyRequestOrigin(request.origin, alloyHost),
+        ignoreRequestHook: (request) =>
+          isTelemetryBackendRequestOrigin(request.origin, telemetryBackendHosts),
         // Same default-naming issue as above, for the self-fetch() calls
         // Server Components make to this app's own Route Handlers.
         requestHook: (span, request) => {
@@ -124,7 +131,7 @@ export function registerServerOtel(): void {
 // A second, deliberately NOT globally-registered TracerProvider, so the
 // mock backend's own spans (src/lib/mock-backend, src/app/api/**) carry a
 // distinct service.name ("<OTEL_SERVICE_NAME>-mock-api") instead of the
-// main app's. It reuses the same ALLOY_URL — same destination, just a
+// main app's. It reuses the same Tempo URL — same destination, just a
 // different resource — see design/DESIGN.md §7.7. Obtained via
 // getMockApiTracer(), never through the global trace API. Created lazily
 // (and cached on globalThis) rather than only in registerServerOtel(), so
@@ -132,10 +139,11 @@ export function registerServerOtel(): void {
 // that never ran registerServerOtel() itself.
 function getOrCreateMockApiTracerProvider(): NodeTracerProvider {
   if (!globalThis.__mockApiTracerProvider) {
-    const alloyUrl = requireAlloyUrl();
+    const tempoUrl = requireTempoUrl();
     const mockApiResource = buildResource({ "service.runtime": "nodejs" }, "mock-api");
     const mockApiTraceExporter = new OTLPTraceExporter({
-      url: `${alloyUrl}/v1/traces`,
+      url: `${tempoUrl}/v1/traces`,
+      headers: getGrafanaAuthHeaders,
     });
     globalThis.__mockApiTracerProvider = new NodeTracerProvider({
       resource: mockApiResource,
@@ -163,10 +171,11 @@ export function getMockApiTracer(): Tracer {
 // real gap in Mimir, not a stale value. See design/DESIGN.md §7.4.1.
 function getOrCreateServiceUpMeterProvider(): MeterProvider {
   if (!globalThis.__serviceUpMeterProvider) {
-    const alloyUrl = requireAlloyUrl();
+    const mimirUrl = requireMimirUrl();
     const serviceUpMetricExporter = new OTLPMetricExporter({
-      url: `${alloyUrl}/v1/metrics`,
+      url: `${mimirUrl}/v1/metrics`,
       temporalityPreference: AggregationTemporality.DELTA,
+      headers: getGrafanaAuthHeaders,
     });
     globalThis.__serviceUpMeterProvider = new MeterProvider({
       resource: buildResource({ "service.runtime": "nodejs" }),
@@ -185,9 +194,10 @@ function pathnameOf(rawUrl: string): string {
 }
 
 // Matches HttpInstrumentation's ignoreOutgoingRequestHook: true means
-// "this request is this app's own OTLP export to Alloy, don't trace it."
-function isAlloyRequest(request: RequestOptions, alloyHost: string): boolean {
-  return getRequestHost(request) === alloyHost;
+// "this request is this app's own OTLP export to Tempo/Mimir, don't trace it."
+function isTelemetryBackendRequest(request: RequestOptions, hosts: Set<string>): boolean {
+  const host = getRequestHost(request);
+  return host !== undefined && hosts.has(host);
 }
 
 function getRequestHost(request: RequestOptions): string | undefined {
@@ -202,9 +212,9 @@ function getRequestHost(request: RequestOptions): string | undefined {
 
 // Same check for UndiciInstrumentation's ignoreRequestHook, whose request
 // shape carries a single `origin` string ("http://host:port") instead.
-function isAlloyRequestOrigin(origin: string, alloyHost: string): boolean {
+function isTelemetryBackendRequestOrigin(origin: string, hosts: Set<string>): boolean {
   try {
-    return new URL(origin).host === alloyHost;
+    return hosts.has(new URL(origin).host);
   } catch {
     return false;
   }
@@ -271,15 +281,4 @@ function isStaticAssetSpan(spanName: string, attributes: Attributes): boolean {
     const value = attributes[key];
     return typeof value === "string" && isStaticAssetPath(value);
   });
-}
-
-function requireAlloyUrl(): string {
-  const alloyUrl = process.env.ALLOY_URL;
-  if (!alloyUrl) {
-    throw new Error(
-      "ALLOY_URL environment variable is required to start the server-side OTEL exporters " +
-        "(see .env.example and design/DESIGN.md §4)."
-    );
-  }
-  return alloyUrl.endsWith("/") ? alloyUrl.slice(0, -1) : alloyUrl;
 }

@@ -16,8 +16,10 @@ import { buildResource } from "./resource";
 // Browser-side OTEL wiring, called once from src/instrumentation-client.ts.
 //
 // Sends telemetry to the same-origin OTLP_ENDPOINT ("/otlp" by default),
-// which Next's rewrites() (see proxy.conf.js) forwards to ALLOY_URL. The
-// browser never learns ALLOY_URL directly. See design/DESIGN.md §7.3/§8.
+// which src/app/otlp/[...path]/route.ts forwards to TEMPO_URL or MIMIR_URL
+// (depending on signal) and attaches the App ID auth header to. The
+// browser never learns TEMPO_URL, MIMIR_URL, or the App ID credential.
+// See design/DESIGN.md §7.3/§7.11/§8.
 
 let registered = false;
 

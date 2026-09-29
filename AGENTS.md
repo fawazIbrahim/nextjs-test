@@ -14,14 +14,18 @@ A simple Next.js (App Router, TypeScript) app that lists restaurants and,
 per restaurant, shows its menu and prices. Data is fetched from a mocked
 backend (Next.js Route Handlers with static fixtures — there is no real
 backend). The app emits OpenTelemetry traces and metrics (including
-custom, app-defined metrics) to Grafana Alloy over OTLP/HTTP.
+custom, app-defined metrics) directly to Grafana's Tempo (traces) and
+Mimir (metrics) backends over OTLP/HTTP, no collector in between,
+authenticated with a bearer token from IBM Cloud App ID.
 
 **Before changing anything telemetry-, proxy-, or mock-backend-related,
 read [`design/DESIGN.md`](design/DESIGN.md) first.** It is the source of
 truth for *why* things are wired the way they are (e.g. why server-side
-OTLP exporters talk to `ALLOY_URL` directly while the browser goes through
-the `/otlp` proxy — see its §7.3). If you change the actual architecture,
-update that document in the same change; don't let it drift from the code.
+OTLP exporters talk to `TEMPO_URL`/`MIMIR_URL` directly while the browser
+goes through the `/otlp` proxy — see its §7.3, and how the App ID auth
+layer is kept removable — see its §7.11). If you change the actual
+architecture, update that document in the same change; don't let it drift
+from the code.
 
 ## Commands
 
@@ -37,16 +41,20 @@ here.
 ## Required environment variables
 
 See `design/DESIGN.md` §4 and `.env.example` for the authoritative list.
-At minimum, `ALLOY_URL` must be set (the app's `next.config.ts` throws at
-startup if it's missing) — copy `.env.example` to `.env.local` and fill it
-in before running `npm run dev`.
+At minimum, `TEMPO_URL` and `MIMIR_URL` must be set (`src/otel/server.ts`
+and `src/app/otlp/[...path]/route.ts` both throw a clear error the first
+time either is needed if it's missing) — copy `.env.example` to
+`.env.local` and fill it in before running `npm run dev`. Set
+`TELEMETRY_AUTH_PROVIDER=appid` plus the `APPID_*` vars to enable IBM
+Cloud App ID auth (see `design/DESIGN.md` §7.11); leave it unset for local
+dev against the mock OTLP receiver.
 
 ## Architecture at a glance
 
 - `src/app/` — pages (App Router): `/` (restaurant list), `/restaurants/[id]` (menu + prices), `/health` (liveness check, see `design/DESIGN.md` §5.4).
 - `src/app/api/` — the mocked backend (Route Handlers over static fixtures in `src/lib/mock-backend/`).
-- `src/otel/` — OpenTelemetry setup: `server.ts` / `client.ts` (SDK registration, called from `src/instrumentation.ts` / `src/instrumentation-client.ts`), `metrics.ts` (custom metrics helper), `tracing.ts` (`withSpan()` custom span helper), `service-up.ts` (`recordHealthCheck()`, the `/health` freshness-windowed gauge — see below) — use these instead of reaching for `@opentelemetry/api` directly in app code.
-- `proxy.conf.js` + `next.config.ts` — the `/otlp` → `ALLOY_URL` rewrite. Despite the filename, this is **not** Next.js's `proxy.ts` file convention (Next 16 renamed the old `middleware.ts` to `proxy.ts`, an unrelated request-interception hook); `proxy.conf.js` is a plain config module feeding Next's `rewrites()`. Don't confuse the two — see `design/DESIGN.md` §8.1.
+- `src/otel/` — OpenTelemetry setup: `server.ts` / `client.ts` (SDK registration, called from `src/instrumentation.ts` / `src/instrumentation-client.ts`), `metrics.ts` (custom metrics helper), `tracing.ts` (`withSpan()` custom span helper), `service-up.ts` (`recordHealthCheck()`, the `/health` freshness-windowed gauge — see below), `backends.ts` (`requireTempoUrl()`/`requireMimirUrl()`), `auth/` (the removable IBM App ID auth layer, `getGrafanaAuthHeaders()` — see `design/DESIGN.md` §7.11) — use these instead of reaching for `@opentelemetry/api` directly in app code.
+- `src/app/otlp/[...path]/route.ts` — the browser-facing OTLP proxy: routes `/otlp/v1/traces`/`/otlp/v1/metrics` to `TEMPO_URL`/`MIMIR_URL` respectively, attaching the App ID auth header server-side. Not Next.js's `proxy.ts` file convention (Next 16 renamed the old `middleware.ts` to `proxy.ts`, an unrelated request-interception hook) — this is an ordinary Route Handler. See `design/DESIGN.md` §8.
 
 ## Conventions for AI agents working in this repo
 
@@ -54,9 +62,15 @@ in before running `npm run dev`.
   `src/otel/*`. Duplicate `NodeTracerProvider`/`MeterProvider` registration
   is a real bug class here (global OTEL state, easy to double-register
   under Next's Fast Refresh).
-- Don't have the browser talk to `ALLOY_URL` directly, and don't have the
-  server talk through `/otlp` — that split is intentional (§7.3 of the
-  design doc), not an oversight.
+- Don't have the browser talk to `TEMPO_URL`/`MIMIR_URL` directly, and
+  don't have the server talk through `/otlp` — that split is intentional
+  (§7.3 of the design doc), not an oversight.
+- Don't wire App ID-specific logic into `src/otel/server.ts` or the `/otlp`
+  route directly — it goes through `getGrafanaAuthHeaders()` from
+  `src/otel/auth/`, the one function everything else depends on. That
+  isolation is deliberate (§7.11): it's what makes the whole auth layer
+  removable by deleting one directory instead of hunting through the OTEL
+  wiring.
 - The mock backend's spans (`src/lib/mock-backend/*`, `src/app/api/restaurants/**`)
   deliberately report under a different `service.name` (`<OTEL_SERVICE_NAME>-mock-api`)
   than the rest of the app, via `getMockApiTracer()` from `src/otel/server.ts`
@@ -83,11 +97,12 @@ in before running `npm run dev`.
   `HttpInstrumentation` — see `design/DESIGN.md` §7.9. Don't remove either
   filter, and if a new static-like route needs excluding, add its prefix
   to `STATIC_ASSET_PATH_PREFIXES` rather than writing a third mechanism.
-- This app's own OTLP export POSTs to `ALLOY_URL` are also deliberately
-  excluded from tracing (`ignoreOutgoingRequestHook`/`ignoreRequestHook`
-  in `src/otel/server.ts`, matching on the resolved request host) — see
-  `design/DESIGN.md` §7.10. Don't remove it; without it, exporting a
-  trace batch creates a new span about exporting a trace batch.
+- This app's own OTLP export POSTs to `TEMPO_URL`/`MIMIR_URL` are also
+  deliberately excluded from tracing (`ignoreOutgoingRequestHook`/
+  `ignoreRequestHook` in `src/otel/server.ts`, matching a two-host `Set`
+  against the resolved request host) — see `design/DESIGN.md` §7.10. Don't
+  remove it; without it, exporting a trace batch creates a new span about
+  exporting a trace batch.
 - `page.restaurant-detail <id>` and `mock-backend.get-restaurant <id>`
   intentionally put the resolved restaurant id in the span *name*
   (`restaurant.id` is also kept as an attribute) — an explicit exception
